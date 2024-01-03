@@ -162,3 +162,8 @@ cython_debug/
 # mac
 .DS_Store
 .vscode/extensions.json
+
+# 
+*.mp4
+*.png
+*.h5
