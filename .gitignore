@@ -167,3 +167,5 @@ cython_debug/
 *.mp4
 *.png
 *.h5
+
+chapter-6/mutual-information
