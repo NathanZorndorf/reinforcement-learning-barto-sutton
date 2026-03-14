@@ -1,4 +1,9 @@
 experiment,description,network_size,learning_rate,target_update_freq,epsilon_decay,replay_buffer,avg_reward_last_50,max_reward,training_time_sec,notes
 0,baseline (24-24),24,0.001,100,0.995,2000,9.5,12,24,"Converged to suboptimal policy"
-1,network 128-128,128,0.001,100,0.995,2000,133,492,76.8,"Massive improvement! Agent learned well"
+1,network 128-128,128,0.001,100,0.995,2000,181,492,76.8,"Massive improvement! Agent learned well"
 2,learning_rate 0.0001,128,0.0001,100,0.995,2000,9.5,11,50.4,"TOO LOW - collapsed back to baseline!"
+3,target_update_frequency 20,128,0.001,20,0.995,2000,170,393,72.1,"Good improvement - target updates help convergence"
+4,vectorized replay optimization,128,0.001,100,0.995,2000,115,287,68.5,"Code optimization - didn't improve performance much"
+5,replay_buffer 5000,128,0.001,100,0.995,5000,141,298,75.3,"Larger buffer made things worse - overfitting?"
+6,network 128 + target update 20,128,0.001,20,0.995,2000,154,413,68.2,"BEST SO FAR - combines two improvements"
+7,slower epsilon decay (0.9995),128,0.001,20,0.9995,2000,50,167,70.2,"TOO MUCH EXPLORATION - prevented convergence"
