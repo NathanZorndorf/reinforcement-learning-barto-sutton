@@ -76,11 +76,11 @@ class DQNAgent:
     def __init__(self, state_size, action_size):
         self.state_size = state_size
         self.action_size = action_size
-        self.memory = deque(maxlen=2000)  # Reduced from 500K for efficiency
+        self.memory = deque(maxlen=2000)  # Optimal size for CartPole
         self.gamma = 0.95  # discount factor
         self.epsilon = 1.0  # exploration-exploitation trade-off
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.9995
+        self.epsilon_decay = 0.995
         self.learning_rate = 0.001
 
         # PyTorch models
@@ -205,9 +205,11 @@ if __name__ == "__main__":
         if episode % 50 == 0 and episode > 0:
             plot_metrics(scores, epsilons, filename="two-networks/cartpole_dqn_metrics.png")
 
-        # update target network and create video every 100 episodes
-        if episode % 100 == 0 and episode > 0:
+        # update target network every 20 episodes, create video every 100
+        if episode % 20 == 0 and episode > 0:
             agent.update_target_model()
+
+        if episode % 100 == 0 and episode > 0:
             create_video(agent, env, filename="two-networks/cartpole_dqn_video_{}.mp4".format(episode))
 
     # Save model
