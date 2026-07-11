@@ -58,7 +58,7 @@ class Config:
     num_actions: int = 2
     hidden_dim: int = 64            # size of the latent state s^k
 
-    num_simulations: int = 25       # MCTS simulations per real move
+    num_simulations: int = 50       # MCTS simulations per real move
     discount: float = 0.997         # gamma
     num_unroll_steps: int = 5       # K   (how far we unroll the model in training)
     td_steps: int = 10              # n   (horizon of the n-step return)
@@ -300,12 +300,13 @@ def run_mcts(cfg, root, net, min_max):
         backpropagate(cfg, search_path, value.item(), min_max)
 
 
-def expand_root(cfg, net, obs):
+def expand_root(cfg, net, obs, add_noise=True):
     root = Node(prior=0.0)
     with torch.no_grad():
         state, policy_logits, _ = net.initial_inference(obs)
     expand_node(cfg, root, policy_logits, state, reward=0.0)
-    add_exploration_noise(cfg, root)
+    if add_noise:
+        add_exploration_noise(cfg, root)
     return root
 
 
@@ -602,7 +603,7 @@ def record_video(cfg, net, path, fps=30):
     done = False
     while not done:
         obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
-        root = expand_root(cfg, net, obs_t)
+        root = expand_root(cfg, net, obs_t, add_noise=False)
         run_mcts(cfg, root, net, MinMaxStats())
         visit_counts = np.array(
             [root.children[a].visit_count for a in range(cfg.num_actions)],
@@ -616,6 +617,29 @@ def record_video(cfg, net, path, fps=30):
     imageio.mimwrite(path, frames, fps=fps)
 
 
+def play_best(cfg, checkpoint_path, episodes=5):
+    """Load a checkpoint and play with pure exploitation: no Dirichlet root
+    noise, temperature=0 action selection. MCTS/PUCT still runs as usual --
+    this only removes the exploration added on top for self-play."""
+    if not os.path.exists(checkpoint_path):
+        raise ValueError(f"Checkpoint not found: {checkpoint_path}")
+
+    net = MuZeroNet(cfg)
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    net.load_state_dict(ckpt["model_state_dict"])
+    net.eval()
+
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    video_dir = os.path.join(out_dir, "videos")
+    os.makedirs(video_dir, exist_ok=True)
+
+    for ep in range(episodes):
+        video_path = os.path.join(video_dir, f"play_best_{ep:02d}.mp4")
+        record_video(cfg, net, video_path)
+        print(f"episode {ep} -> saved {video_path}")
+
+
+
 # ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
@@ -623,7 +647,7 @@ def main():
     cfg = Config()
     net = MuZeroNet(cfg)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
-    optimizer = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
     # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
     
     buffer = ReplayBuffer(cfg)
@@ -631,9 +655,12 @@ def main():
     out_dir = os.path.dirname(os.path.abspath(__file__))
     plot_path = os.path.join(out_dir, "training_progress.png")
     video_dir = os.path.join(out_dir, "videos")
+    ckpt_path = os.path.join(out_dir, "checkpoints", "best.pt")
     os.makedirs(video_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
     iter_lengths, iter_losses = [], []
+    best_length = -1
 
     for it in range(cfg.num_iterations):
         # --- self-play ---
@@ -641,7 +668,13 @@ def main():
         for _ in range(cfg.games_per_iteration):
             game = play_game(cfg, net)
             buffer.save(game)
-            lengths.append(len(game.actions))   # CartPole reward == episode length
+            length = len(game.actions)   # CartPole reward == episode length
+            lengths.append(length)
+
+            if length > best_length:
+                best_length = length
+                torch.save({"model_state_dict": net.state_dict(), "iter": it, "length": best_length}, ckpt_path)
+                print(f"  new high score! length {best_length} -> saved {ckpt_path}")
 
         # --- train ---
         losses = []
@@ -660,13 +693,26 @@ def main():
 
         plot_progress(iter_lengths, iter_losses, plot_path)
 
-        if (it + 1) % 10 == 0:
+        if (it + 1) % 50 == 0:
             video_path = os.path.join(video_dir, f"iter_{it + 1:04d}.mp4")
             record_video(cfg, net, video_path)
             print(f"  saved video -> {video_path}")
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--play", type=str, default=None,
+                        help="path to a checkpoint (e.g. checkpoints/best.pt) to watch play "
+                             "instead of training, with pure exploitation")
+    parser.add_argument("--episodes", type=int, default=5)
+    args = parser.parse_args()
+
     if gym is None:
         raise SystemExit("Please `pip install gymnasium torch numpy` first.")
-    main()
+
+    if args.play:
+        play_best(Config(), args.play, episodes=args.episodes)
+    else:
+        main()
