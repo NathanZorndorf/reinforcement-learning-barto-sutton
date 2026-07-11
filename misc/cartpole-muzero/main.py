@@ -73,6 +73,13 @@ class Config:
     games_per_iteration: int = 5
     train_steps_per_iteration: int = 20
 
+    epsilon = 1e-3
+    
+    support_min = -300
+    support_max = 300
+    num_support_bins = abs(support_min) + abs(support_max) + 1  # support bins for value/reward distribution
+    
+
 
 # ----------------------------------------------------------------------------
 # Networks:  h (representation), g (dynamics), f (prediction)
@@ -96,12 +103,12 @@ class MuZeroNet(nn.Module):
             nn.Linear(h + cfg.num_actions, h), nn.ReLU(),
             nn.Linear(h, h), nn.ReLU(),
         )
-        self.reward_head = nn.Linear(h, 1)
+        self.reward_head = nn.Linear(h, cfg.num_support_bins)  # predict reward distribution over support
 
         # f_theta : latent state  ->  (policy logits, value)
         self.pred_body = nn.Sequential(nn.Linear(h, h), nn.ReLU())
         self.policy_head = nn.Linear(h, cfg.num_actions)
-        self.value_head = nn.Linear(h, 1)
+        self.value_head = nn.Linear(h, cfg.num_support_bins)  # predict value distribution over support
 
     def _repr(self, obs):
         return self.representation(obs)
@@ -120,14 +127,14 @@ class MuZeroNet(nn.Module):
     def initial_inference(self, obs):
         """Root of the search: encode the real observation, then evaluate it."""
         s = self._repr(obs)
-        policy_logits, value = self._pred(s)
-        return s, policy_logits, value
+        policy_logits, value_logits = self._pred(s)
+        return s, policy_logits, value_logits
 
     def recurrent_inference(self, state, action):
         """One imagined step: advance the latent state, predict reward, evaluate."""
         nxt, reward = self._dyn(state, action)
-        policy_logits, value = self._pred(nxt)
-        return nxt, reward, policy_logits, value
+        policy_logits, value_logits = self._pred(nxt)
+        return nxt, reward, policy_logits, value_logits
 
 
 # ----------------------------------------------------------------------------
@@ -275,9 +282,11 @@ def run_mcts(cfg, root, net, min_max):
         #    next latent state from the PARENT's state + the chosen action.
         parent = search_path[-2]
         with torch.no_grad():
-            next_state, reward, policy_logits, value = net.recurrent_inference(
+            next_state, reward_logits, policy_logits, value_logits = net.recurrent_inference(
                 parent.hidden_state, torch.tensor([action])
             )
+        value = support_to_scalar(value_logits, cfg)  # convert value distribution to scalar
+        reward = support_to_scalar(reward_logits, cfg)  # convert reward distribution to scalar
         expand_node(cfg, node, policy_logits, next_state, reward=reward.item())
 
         # 3. BACKUP
@@ -287,7 +296,7 @@ def run_mcts(cfg, root, net, min_max):
 def expand_root(cfg, net, obs):
     root = Node(prior=0.0)
     with torch.no_grad():
-        state, policy_logits, value = net.initial_inference(obs)
+        state, policy_logits, _ = net.initial_inference(obs)
     expand_node(cfg, root, policy_logits, state, reward=0.0)
     add_exploration_noise(cfg, root)
     return root
@@ -447,6 +456,64 @@ def scale_gradient(tensor, scale):
     pass. Used to down-weight the gradient entering the dynamics function."""
     return tensor * scale + tensor.detach() * (1 - scale)
 
+def scaling_transform(x, cfg):
+    return torch.sign(x) * (torch.sqrt(torch.abs(x)+1) - 1) + cfg.epsilon * x
+
+def inverse_scaling_transform(y, cfg):
+    # sign(y) * ( ((sqrt(1 + 4*eps*(|y| + 1 + eps)) - 1)/(2*eps))**2 - 1 )
+    tmp = (torch.sqrt(1 + 4 * cfg.epsilon * (torch.abs(y) + 1 + cfg.epsilon)) - 1) / (2 * cfg.epsilon)
+    return torch.sign(y) * (tmp ** 2 - 1)
+
+def scalar_to_support(x, cfg):
+    # transform the scalar values using the MuZero scaling transform
+    x = scaling_transform(x, cfg)
+    # define support bounds centered at zero
+    support_min = cfg.support_min
+    support_max = cfg.support_max
+    support_bins = support_max - support_min + 1  # total number of bins in the support
+
+    # clip transformed values to the support range
+    x = x.clamp(support_min, support_max)
+    # flatten the tensor so we can operate on all elements uniformly
+    x_flat = x.reshape(-1)
+
+    # lower support bin index for each value
+    lower = x_flat.floor()
+    # upper support bin is one above lower, capped by the max support
+    upper = torch.clamp(lower + 1, max=support_max)
+
+    # convert support values to zero-based tensor indices
+    lower_idx = (lower - support_min).long()
+    upper_idx = (upper - support_min).long()
+
+    # fraction assigned to the upper bin
+    upper_weight = x_flat - lower
+    # fraction assigned to the lower bin
+    lower_weight = 1.0 - upper_weight
+
+    # initialize a zero distribution for each scalar value
+    dist = torch.zeros((x_flat.shape[0], support_bins), device=x.device, dtype=x.dtype)
+    # add lower-bin weights into the distribution
+    dist.scatter_add_(1, lower_idx.unsqueeze(1), lower_weight.unsqueeze(1))
+    # add upper-bin weights into the distribution
+    dist.scatter_add_(1, upper_idx.unsqueeze(1), upper_weight.unsqueeze(1))
+
+    # reshape back to the original input shape plus the support dimension
+    return dist.view(*x.shape, support_bins)
+
+def support_to_scalar(logits, cfg):
+    # convert logits to probabilities using softmax
+    probs = torch.softmax(logits, dim=-1)
+    # define support bounds centered at zero
+    support_min = cfg.support_min
+    support_max = cfg.support_max
+    # create a tensor of support values corresponding to each bin
+    support_values = torch.arange(support_min, support_max + 1, device=logits.device, dtype=logits.dtype)
+    # compute the expected value by summing over the
+    expected_value = (probs * support_values).sum(dim=-1)
+    # apply the inverse scaling transform to map back to the original scalar range
+    return inverse_scaling_transform(expected_value, cfg)
+
 
 def soft_cross_entropy(logits, target_dist):
     logp = F.log_softmax(logits, dim=-1) # log(softmax(logits)) - so log(probability distribution),i.e. "surprisal" of outcome i under predicted distribution; in (-∞, 0]
@@ -461,17 +528,22 @@ def update_weights(cfg, net, optimizer, batch: List[Sample]):
     tgt_p = torch.tensor(np.array([b.target_policies for b in batch]))  # (B, K+1, A)
 
     # k = 0 : root (representation + prediction), no reward prediction
-    state, policy_logits, value = net.initial_inference(obs)
-    loss = soft_cross_entropy(policy_logits, tgt_p[:, 0]) + F.mse_loss(value, tgt_v[:, 0])
+    state, policy_logits, value_logits = net.initial_inference(obs)
+
+    loss = (
+        soft_cross_entropy(policy_logits, tgt_p[:, 0]) 
+        + 0.25 * soft_cross_entropy(value_logits, scalar_to_support(tgt_v[:, 0], cfg))  # bring the target into the network's space
+        
+    )
 
     # k = 1..K : imagined steps along the real action sequence
     for k in range(cfg.num_unroll_steps):
-        state, reward, policy_logits, value = net.recurrent_inference(state, actions[:, k])
+        state, reward_logits, policy_logits, value_logits = net.recurrent_inference(state, actions[:, k])
         state = scale_gradient(state, 0.5)
         step_loss = (
             soft_cross_entropy(policy_logits, tgt_p[:, k + 1])
-            + F.mse_loss(value, tgt_v[:, k + 1])
-            + F.mse_loss(reward, tgt_r[:, k + 1])
+            + 0.25 * soft_cross_entropy(value_logits, scalar_to_support(tgt_v[:, k + 1], cfg))  # bring the target into the network's space
+            + soft_cross_entropy(reward_logits, scalar_to_support(tgt_r[:, k + 1], cfg))  # bring the target into the network's space
         )
         loss = loss + step_loss / cfg.num_unroll_steps
 
