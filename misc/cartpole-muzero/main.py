@@ -27,6 +27,7 @@ Simplifications vs. the real MuZero paper (fine for CartPole, revisit for Atari)
 """
 
 import math
+import os
 import random
 from dataclasses import dataclass, field
 from typing import List
@@ -35,6 +36,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import imageio.v2 as imageio
 
 try:
     import gymnasium as gym
@@ -69,7 +75,7 @@ class Config:
     replay_capacity: int = 500      # number of games kept
     lr: float = 2e-3
 
-    num_iterations: int = 200       # outer loop: (self-play games -> train)
+    num_iterations: int = 250       # outer loop: (self-play games -> train)
     games_per_iteration: int = 5
     train_steps_per_iteration: int = 20
 
@@ -206,7 +212,8 @@ def ucb_score(cfg: Config, parent: Node, child: Node, min_max: MinMaxStats) -> f
     """
     Q = child.value() 
     Q = min_max.normalize(Q)
-    U = cfg.c1 * child.prior * np.sqrt(parent.visit_count) / (1 + child.visit_count) # TODO: replace c1 with full expression 
+    c1 = cfg.c1 + np.log((parent.visit_count + cfg.c2 + 1) / cfg.c2)
+    U = c1 * child.prior * np.sqrt(parent.visit_count) / (1 + child.visit_count) # TODO: replace c1 with full expression 
     return Q + U
 
 # =============================================================================
@@ -554,13 +561,79 @@ def update_weights(cfg, net, optimizer, batch: List[Sample]):
 
 
 # ----------------------------------------------------------------------------
+# Plotting & video capture
+# ----------------------------------------------------------------------------
+def plot_progress(iter_lengths, iter_losses, out_path, running_window=20):
+    """Overwrite `out_path` with a 2-panel chart: episode length (+ running
+    average) and training loss, one point per outer-loop iteration so far."""
+    iters = np.arange(1, len(iter_lengths) + 1)
+
+    fig, (ax_len, ax_loss) = plt.subplots(1, 2, figsize=(12, 4.5))
+
+    ax_len.plot(iters, iter_lengths, color="tab:blue", alpha=0.35, label="episode length")
+    if len(iter_lengths) >= running_window:
+        kernel = np.ones(running_window) / running_window
+        running_avg = np.convolve(iter_lengths, kernel, mode="valid")
+        ax_len.plot(iters[running_window - 1:], running_avg, color="tab:blue",
+                    label=f"running avg ({running_window})")
+    ax_len.axhline(475, color="tab:green", linestyle="--", alpha=0.6, label="solved (475)")
+    ax_len.set_title("Episode length")
+    ax_len.set_xlabel("iteration")
+    ax_len.set_ylabel("length")
+    ax_len.legend(loc="upper left")
+
+    ax_loss.plot(iters, iter_losses, color="tab:red")
+    ax_loss.set_yscale("log")
+    ax_loss.set_title("Training loss")
+    ax_loss.set_xlabel("iteration")
+    ax_loss.set_ylabel("loss (log scale)")
+
+    fig.tight_layout()
+    fig.savefig(out_path)
+    plt.close(fig)
+
+
+def record_video(cfg, net, path, fps=30):
+    """Play one greedy (temperature=0) game using the current net + MCTS and
+    save the rendered frames as an mp4."""
+    env = gym.make(cfg.env_id, render_mode="rgb_array")
+    obs, _ = env.reset()
+    frames = [env.render()]
+    done = False
+    while not done:
+        obs_t = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
+        root = expand_root(cfg, net, obs_t)
+        run_mcts(cfg, root, net, MinMaxStats())
+        visit_counts = np.array(
+            [root.children[a].visit_count for a in range(cfg.num_actions)],
+            dtype=np.float32,
+        )
+        action = select_action(visit_counts, temperature=0.0)
+        obs, _, term, trunc, _ = env.step(action)
+        done = term or trunc
+        frames.append(env.render())
+    env.close()
+    imageio.mimwrite(path, frames, fps=fps)
+
+
+# ----------------------------------------------------------------------------
 # Main loop
 # ----------------------------------------------------------------------------
 def main():
     cfg = Config()
     net = MuZeroNet(cfg)
-    optimizer = torch.optim.Adam(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.1)
+    optimizer = torch.optim.AdamW(net.parameters(), lr=cfg.lr, weight_decay=1e-4)
+    # scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=50, gamma=0.5)
+    
     buffer = ReplayBuffer(cfg)
+
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    plot_path = os.path.join(out_dir, "training_progress.png")
+    video_dir = os.path.join(out_dir, "videos")
+    os.makedirs(video_dir, exist_ok=True)
+
+    iter_lengths, iter_losses = [], []
 
     for it in range(cfg.num_iterations):
         # --- self-play ---
@@ -575,8 +648,22 @@ def main():
         for _ in range(cfg.train_steps_per_iteration):
             losses.append(update_weights(cfg, net, optimizer, buffer.sample_batch()))
 
-        print(f"iter {it:3d} | avg episode length {np.mean(lengths):6.1f} "
-              f"| loss {np.mean(losses):.3f}")
+        # scheduler.step()
+
+        avg_len = float(np.mean(lengths))
+        avg_loss = float(np.mean(losses))
+        iter_lengths.append(avg_len)
+        iter_losses.append(avg_loss)
+
+        print(f"iter {it:3d} | avg episode length {avg_len:6.1f} "
+              f"| loss {avg_loss:.3f}") #| lr {scheduler.get_last_lr()[0]:.1e}")
+
+        plot_progress(iter_lengths, iter_losses, plot_path)
+
+        if (it + 1) % 10 == 0:
+            video_path = os.path.join(video_dir, f"iter_{it + 1:04d}.mp4")
+            record_video(cfg, net, video_path)
+            print(f"  saved video -> {video_path}")
 
 
 if __name__ == "__main__":
